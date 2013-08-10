@@ -10,7 +10,7 @@ import water.fvec.*;
 
 public class GBMTest extends TestUtil {
 
-  @BeforeClass public static void stall() { stall_till_cloudsize(1); }
+  @BeforeClass public static void stall() { stall_till_cloudsize(2); }
 
   // ==========================================================================
   /*@Test*/ public void testBasicGBM() {
