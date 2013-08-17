@@ -1,7 +1,6 @@
 package hex.gbm;
 
 import hex.gbm.DTree.*;
-import hex.rng.MersenneTwisterRNG;
 import java.util.Arrays;
 import java.util.Random;
 import water.*;
@@ -9,6 +8,7 @@ import water.H2O.H2OCountedCompleter;
 import water.fvec.*;
 import water.util.Log.Tag.Sys;
 import water.util.Log;
+import water.util.Utils;
 
 // Random Forest Trees
 public class DRF extends Job {
@@ -56,11 +56,11 @@ public class DRF extends Job {
     final long nrows = vresponse.length();
     assert !vresponse._isInt || (vresponse.max() - vresponse.min()) < 10000; // Too many classes?
     int ymin = (int)vresponse.min();
-    short nclass = vresponse._isInt ? (short)(vresponse.max()-ymin+1) : 0;
+    final short nclass = vresponse._isInt ? (short)(vresponse.max()-ymin+1) : 0;
 
     // Make a master list of trees to be worked on.
     // Make a deterministic set of RNG seeds used to pick split columns.
-    final Trees trees = new Trees(ntrees,new MersenneTwisterRNG(new int[]{(int)(seed>>32L),(int)seed}));
+    final Trees trees = new Trees(ncols, ntrees,Utils.getRNG(seed));
     _treeKey = Key.make(Key.make().toString(),(byte)0,Key.BUILT_IN_KEY);
     UKV.put(_treeKey,trees);
 
@@ -69,7 +69,7 @@ public class DRF extends Job {
       @Override public void lcompute() {
         int tree;
         while( (tree = ((GetOne)new GetOne().invoke(_treeKey))._tree) != -1 )
-          doTree(fr,maxDepth,mtrys,(float)sampleRate,trees._seeds[tree],tree);
+          doTree(fr,nclass,maxDepth,mtrys,sampleRate,trees._seeds[tree],tree);
         tryComplete();
       }
       @Override public void reduce(DRemoteTask drt) { }
@@ -78,6 +78,12 @@ public class DRF extends Job {
     // Get the updated list
     System.out.println("All trees done! "+t_drf);
     Trees trees2 = UKV.get(_treeKey);
+
+    System.out.println("Confusion Matrix ");
+    long[][] cm = trees2.score(fr);
+    for( long ls[] : cm )
+      System.out.println(Arrays.toString(ls));
+
     UKV.remove(_treeKey);
     System.out.println(trees2);
   }
@@ -85,14 +91,29 @@ public class DRF extends Job {
   // Master list of tree-seeds, and which trees are being worked on.
   // This list is atomically updated by nodes as they work on trees.
   private static class Trees extends Iced {
+    final int _ncols;           // Number of columns in the model
     final long [] _seeds;       // Random gen seeds per-tree
     final Key [] _treeKeys;     // Tree Keys, set as trees are completed
     int _next;                  // Next un-owned tree-gen
-    Trees( int ntrees, Random rand ) {
+    Trees( int ncols, int ntrees, Random rand ) {
+      _ncols = ncols;
       _treeKeys = new Key[ntrees];
       _seeds = new long[ntrees];
       for( int i=0; i<ntrees; i++ )
         _seeds[i] = rand.nextLong();
+    }
+
+    // Gather the trees all locally
+    void gather() {
+      for( Key k : _treeKeys ) {
+      }
+    }
+
+    // Score a dataset; returns a CM
+    long[][] score( Frame fr ) {
+      assert fr.numCols()==_ncols;
+
+      return null;
     }
   }
 
@@ -108,7 +129,7 @@ public class DRF extends Job {
 
   // --------------------------------------------------------------------------
   // Compute a single RF tree
-  private void doTree( final Frame fr, final int maxDepth, final int mtrys, final double sampleRate, long seed, int tree) {
+  private void doTree( final Frame fr, final short nclass, final int maxDepth, final int mtrys, final double sampleRate, long seed, int tree) {
     Timer t_tree = new Timer();
     System.out.println("Working on tree "+tree);
 
@@ -116,20 +137,17 @@ public class DRF extends Job {
     // cookie (Key) to guide further tree building.
     DRFTree root = new Start1Tree(fr).invokeOnAllNodes()._drf;
     // Capture and reset root info
-    final Key[] keys = root._keys;   root._keys = null;
     final int[] ends = root._begs;   root._begs = new int[ends.length];
-    System.out.println("ROOT="+root.toString(ends));
+    Key keys[] = root._keys;
 
     // Split the top-level tree based on random sampling.
     // root._kids[0] will be sampled-in, and root._kids[1] will be sampled-out
-    new SampleSplit(root,keys,ends,sampleRate,seed).invokeOnAllNodes();
+    new SampleSplit(root,ends,sampleRate,seed).invokeOnAllNodes();
     DRFTree root0 = root._kids[0];
     DRFTree root1 = root._kids[1];
-    root0._keys = keys;
+    root0._keys = keys;         // Put these back (not passed back)
     // End of tree 'root0' is also the beginning of tree 'root1'.
     final int[] ends0 = root1._begs;
-    System.out.println("ROOT2 IN ="+root0.toString(ends0));
-    System.out.println("ROOT2 OUT="+root1.toString(ends));
 
     // Build an initial set of columns to begin tree-splitting on
     int ncols=fr.numCols()-1;   // Last column is response
@@ -152,16 +170,19 @@ public class DRF extends Job {
 
     // Build a RNG from the seed.
     long seed2 = seed+ends0[0];
-    Random rand = new MersenneTwisterRNG(new int[]{(int)(seed2>>32L),(int)seed2});
+    Random rand = Utils.getRNG(seed2);
 
     // build a tree
-    root0.doSplit(fr,ends0,cols,mins,maxs,rand,mtrys,maxDepth);
+    root0.doSplit(fr,ends0,cols,mins,maxs,rand,mtrys,0,maxDepth,nclass);
 
     // Remove local temp tree storage
     Futures fs = new Futures();
     for( Key k : keys )
       UKV.remove(k,fs);
     fs.blockForPending();
+
+    root.print();
+
     System.out.println("Done on tree "+tree+" in "+t_tree);
   }
 
@@ -170,9 +191,15 @@ public class DRF extends Job {
   // structure on each JVM.  We only keep the start & end region marker in the
   // large LocalTree here.
   private static class DRFTree extends Iced {
-    Key [] _keys;               // Keys for local data for this one tree
-    int [] _begs;               // Beginning-row for this tree leaf, for all nodes
-    DRFTree[] _kids;            // Kids, if any.
+    // INPUTS, cleared when done
+    Key _keys[/*nodes*/];      // Keys for local data for this one tree
+    // INPUT/OUTPUT - output/set on 1st pass, input thereafter
+    int _begs[];               // Beginning-row for this tree leaf, for all nodes
+    // OUTPUT - set after splitting decisions
+    int _col;              // Column to split on
+    float _min, _step;     // lower-bound & step size for which kid
+    DRFTree _kids[];       // Kids, if any.
+    int _clss[/*nclass*/]; // Class distribution at leaves, or null in the interior
 
     // Called to make a Root DRFTree.  Passed in a key, and the length of the
     // entire row list.  Sets the Key list.
@@ -223,31 +250,112 @@ public class DRF extends Job {
     // (3) split rows
     // Then (4) recursively compute a new level by doing the above steps on
     // each of the several splits.
-    void doSplit(Frame fr, int ends[], int cols[], float mins[], float maxs[], Random rand, int mtrys, int depth) {
-      if( depth == 0 ) return;
+    void doSplit(Frame fr, int ends[/*nodes*/], int cols[/*cols*/], float mins[/*cols*/], float maxs[/*cols*/], Random rand, int mtrys, int depth, int maxDepth, short nclass) {
+      if( depth >= maxDepth ) return;
+      
       // We pick up to mtrys columns, pulling at random without replacement
       // from the entire list of columns.  Picked columns are moved to the end
       // of the column list, and are not picked again.
       int res_col=cols.length;
+      DHisto2 best_hist = null;
+      float best_score = Float.MAX_VALUE;
       for( int i=0; i<mtrys; i++ ) {
         if( res_col == 0 ) break; // Out of choices!
         // (0) Figure a column to split on, drawn at random without replacement.
-        int col = rand.nextInt(res_col);
-        // Move selected column to the end, so we do not pick it again
-        int   tmp1 = cols[col]; cols[col] = cols[--res_col];  cols[res_col] = tmp1;
-        float tmp2 = mins[col]; mins[col] = mins[  res_col];  mins[res_col] = tmp2;
-        float tmp3 = maxs[col]; maxs[col] = maxs[  res_col];  maxs[res_col] = tmp3;
+        int cidx = rand.nextInt(res_col);
 
-        // (1) build histograms
-        System.out.println("Score col "+tmp1+", min="+tmp2+", max="+tmp3);
-        DHisto2 dh2 = new DHisto2(this,ends,tmp1,tmp2,tmp3,fr._vecs[tmp1]._isInt,fr._names[tmp1]).invokeOnAllNodes();
-        System.out.println("mins="+Arrays.toString(dh2._mins)+", maxs="+Arrays.toString(dh2._maxs));
+        // (1) build histograms & score
+        int col = cols[cidx];
+        DHisto2 dh2 = new DHisto2(this,ends,nclass,col,mins[cidx],maxs[cidx],fr._vecs[col]._isInt,fr._names[col]);
+        float f = dh2.invokeOnAllNodes().scoreClassification();
+        // Tigthen mins & maxs based on what is discovered
+        float min = dh2.min();  if( min > mins[cidx] ) mins[cidx] = min;
+        float max = dh2.max();  if( max < maxs[cidx] ) maxs[cidx] = max;
+
+        // (2) figure out best split
+        if( f < best_score ) { best_score = f;  best_hist = dh2; }
+        if( f == 0 ) break;     // No error?  Cannot improve; stop now
+
+        // Move selected column to the end of res_col, so we do not pick it again
+        swap(cols,cidx,--res_col);
+        swap(mins,cidx,  res_col);
+        swap(maxs,cidx,  res_col);
+
+        // See if this column is useless to predict with.  Remove useless columns.
+        if( min == max ) {
+          assert cols[res_col] == col;
+          int last = cols.length-1;
+          swap(cols,res_col,last);  cols = Arrays.copyOf(cols,last);
+          swap(mins,res_col,last);  mins = Arrays.copyOf(mins,last);
+          swap(maxs,res_col,last);  maxs = Arrays.copyOf(maxs,last);
+          i--;                  // Also, pick another column
+        }
+      }
+      assert best_hist != null : indent(depth)+"Out of columns to split on, "+this.toString(ends);
+
+      // A constant response means this is a perfectly predicting leaf
+      if( best_hist.constantResponse() ) {
+        _clss = new int[nclass]; // Record the class distribution
+        for( int b=0; b<best_hist._nbins; b++ )
+          for( int c =0; c<nclass; c++ )
+            _clss[c] += best_hist._clss[b][c];
+        return;
       }
 
+      // Record enough info to 'score' a row on this node
+      _col = best_hist._col;
+      _min = best_hist._min ;
+      _step= best_hist._step;
+      //System.out.print(indent(depth));
+      //for( int c=0; c<cols.length; c++ )
+      //  System.out.print(fr._names[cols[c]]+"/"+mins[c]+"/"+maxs[c]+" ");
+      //System.out.println();
+      int cidx = cols.length-1; // Find the column in my list of active ones; might be removed
+      while( cidx >= 0 && cols[cidx] != best_hist._col ) cidx--;
+      assert cidx== -1 || cols[cidx]==_col;
 
-      // (2) figure out best split
-      // (3) split rows
-      // (4) recursively compute new level
+      // (3) split rows based on best histogram/column
+      Key keys[] = _keys;       // Save for the kids
+      new HistoSplit(this,ends,best_hist).invokeOnAllNodes();
+
+      // (4) recursively compute new levels
+      int nkids = best_hist._nbins;
+      for( int k=0; k<nkids; k++ ) {
+        int local_ends[] = (k+1 < nkids) ?_kids[k+1]._begs : ends;
+        // Skip empty bins
+        int nelems=0;             // Count elements across the cluster in this split
+        for( int i=0; i<local_ends.length; i++ )
+          nelems += local_ends[i]-_kids[k]._begs[i];
+        if( nelems == 0 ) continue; // Bin is empty?  This tree ends here
+
+        // Make private copys of these arrays; each subtree proceeds in
+        // parallel and tightens these arrays as it goes.
+        int   cols2[] = cols.clone(); // All remaining columns to work on
+        float mins2[] = mins.clone(); // Their mins & maxes
+        float maxs2[] = maxs.clone(); // Their mins & maxes
+        // For the chosen column, for each subsplit, we can make tighter min/max
+        if( cidx != -1 ) {      // Constant column might already be removed
+          mins2[cidx] = best_hist._mins[k];
+          maxs2[cidx] = best_hist._maxs[k];
+          // If we shrink to a constant, remove it: cannot split a constant
+          if( mins2[cidx] == maxs2[cidx] ) {
+            int last = cols.length-1;
+            swap(cols2,cidx,last);  cols2 = Arrays.copyOf(cols2,last);
+            swap(mins2,cidx,last);  mins2 = Arrays.copyOf(mins2,last);
+            swap(maxs2,cidx,last);  maxs2 = Arrays.copyOf(maxs2,last);
+          }
+        }
+        // Any sane columns to split on?
+        if( cols2.length == 0 ) { // No more columns to split, make a leaf
+          _kids[k]._clss = new int[nclass];
+          for( int c=0; c<nclass; c++ )
+            _kids[k]._clss[c] = best_hist._clss[k][c];
+        } else {                // Split this set of rows
+          Random rand2 = Utils.getRNG(rand.nextLong());
+          _kids[k]._keys = keys;
+          _kids[k].doSplit(fr,local_ends,cols2,mins2,maxs2,rand2,mtrys,depth+1,maxDepth,nclass);
+        }
+      }
     }
 
     // ---
@@ -261,9 +369,10 @@ public class DRF extends Job {
 
     // Pretty-print
     @Override public String toString() {
-      String s = "{";
-      for( int i=0; i<_begs.length; i++ )
-        s += "["+H2O.CLOUD._memary[i]+","+_begs[i]+"],";
+      String s = "{"+_col+"/"+_min+"/"+_step+",";
+      int sz = H2O.CLOUD.size();
+      for( int i=0; i<sz; i++ )
+        s += "["+H2O.CLOUD._memary[i]+","+(_begs==null ? -1 : _begs[i])+"],";
       return s+"}";
     }
     // Pretty-print with the other ends
@@ -273,14 +382,35 @@ public class DRF extends Job {
         s += "["+H2O.CLOUD._memary[i]+","+_begs[i]+","+ends[i]+"],";
       return s+"}";
     }
+
+    public static String indent( int d ) {
+      String s="";
+      for( int i = 0; i<d; i++ ) s += "  ";
+      return s;
+    }
+
+    // Pretty-print a tree
+    public void print() { System.out.println(print(new StringBuilder(),0)); }
+    private StringBuilder print(StringBuilder sb, int d) {
+      for( int i = 0; i<d; i++ ) sb.append("  ");
+      sb.append("{");
+      if( _clss == null ) {     // Interior?
+        float f = _min;
+        for( int i=0; i<_kids.length; i++ ) sb.append(f+=_step).append(",");
+          
+      } else {                  // Leaf?
+      }
+      return sb;
+    }
+
   }
 
   // ---
   // Start this one Tree on all Nodes.  Return a collection of Keys that
   // uniquely identifies the tree being built on all Nodes.
   private static class Start1Tree extends DRemoteTask<Start1Tree> {
-    final Frame _fr;
-    DRFTree _drf;
+    final Frame _fr;            // INPUT frame
+    DRFTree _drf;               // OUTPUT result top-level tree
     Start1Tree(Frame fr) { _fr = fr; }
     @Override public void lcompute() {
       // One Key per Tree, homed to self.
@@ -288,7 +418,7 @@ public class DRF extends Job {
       // Stash away local tree info on this Node, awaiting the next pass.
       LocalTree lt = new LocalTree(myKey,_fr);
       UKV.put(myKey,lt);
-      _drf = new DRFTree(myKey,lt._rows.length);
+      _drf = new DRFTree(myKey,lt._rows0.length);
       tryComplete();
     }
     // Combine Key/beg lists from across the cluster
@@ -305,14 +435,16 @@ public class DRF extends Job {
   // sections, one from 'beg' to the midpoint, and the other from midpoint to
   // the end.  The actual rows are kept in the giant LocalTree array on each Node.
   private static abstract class Split extends DRemoteTask<Split> {
+    // INPUT - cleared after local work
     DRFTree _drf;               // The guy being split
     int _ends[];                // Ends of split rows
+    // Subclass provided function describing the split decision
     abstract void doSplit(LocalTree lt, int beg, int end);
-    Split( DRFTree drf, Key[] keys, int[] ends ) { 
-      assert drf._keys == null; // These where cleaned out last pass
+
+    Split( DRFTree drf, int[] ends ) { 
+      assert drf._keys != null; // These where cleaned out last pass, make sure they got back
       assert drf._kids == null; // No kids yet
       assert drf.check(ends);   // Quicky bounds check
-      drf._keys = keys;         // Set in afresh
       _drf  = drf; 
       _ends = ends;
     }
@@ -321,9 +453,22 @@ public class DRF extends Job {
       LocalTree lt = DKV.get(_drf._keys[idx]).get();
       int beg = _drf._begs[idx];
       int end =      _ends[idx];
+      // Ordered before the split, so the split can do efficient visitation
       assert lt.isOrdered(beg,end) : "Not ordered";
+
       doSplit(lt,beg,end);
-      assert lt.isOrdered(beg,end) : "Not ordered";
+
+      // Children (if any) are ordered after the split, so the next split layer
+      // starts ordered
+      if( _drf._kids != null ) {
+        int x = end;
+        for( int i=_drf._kids.length-1; i>=0; i-- ) {
+          int b = _drf._kids[i]._begs[idx];
+          assert lt.isOrdered(b,x);
+          x = b;
+        }
+      }
+
       _drf._keys = null;        // No need to pass Keys back
       _drf._begs = null;        // No need to pass begs back
       _ends = null;             // No need to pass ends back
@@ -341,28 +486,87 @@ public class DRF extends Job {
   // Split the top-level tree root based on a sampling criteria.  Move the
   // sampled-out rows to one end and the sampled-in rows to the other.
   private static class SampleSplit extends Split {
+    // INPUTS
     final double _sampleRate;
     final long _seed;
-    SampleSplit( DRFTree root, Key[] keys, int[] ends, double sampleRate, long seed ) { 
-      super(root,keys,ends); 
+    SampleSplit( DRFTree root, int[] ends, double sampleRate, long seed ) { 
+      super(root,ends); 
       _sampleRate = sampleRate;
       _seed = seed;
     }
-    void doSplit( LocalTree lt, int beg, int end ) {
+    @Override void doSplit( LocalTree lt, int beg, int end ) {
       assert beg == 0;          // Sampling is over the whole (local) tree
       long seed = _seed^end; // Determinstic tree seed, reseeded by rows
-      Random rand = new MersenneTwisterRNG(new int[]{(int)(seed>>32L),(int)seed});
+      Random rand = Utils.getRNG(seed);
 
-      // Sample over all rows, splitting the rows
-      int j=end;
-      for( int i=beg; i<j; i++ )
-        if( !(rand.nextFloat() <= _sampleRate) ) // Sample this row OUT
-          lt.swap(i--,--j);
-      Arrays.sort(lt._rows,beg,end);
+      // Count how many in each bin
+      int mid=0;
+      for( int i=beg; i<end; i++ )
+        if( rand.nextFloat() <= _sampleRate )
+          mid++;
+
+      // Pass 2: split by bin-selection: re-run the RNG again
+      Random rerun = Utils.getRNG(seed);
+      long[] rs0 = lt._rows0;
+      long[] rs1 = lt._rows1;
+      int j=beg, k=mid;
+      for( int i=beg; i<end; i++ )
+        if( rerun.nextFloat() <= _sampleRate ) rs1[j++] = rs0[i];
+        else                                   rs1[k++] = rs0[i];
+      assert j==mid && k==end;
+      // Performance wart: should/could flip back and forth between rows0 & rows1
+      System.arraycopy(rs1,beg,rs0,beg,(end-beg));
 
       _drf._kids    = new DRFTree[2];
       _drf._kids[0] = new DRFTree(beg);
-      _drf._kids[1] = new DRFTree( j );
+      _drf._kids[1] = new DRFTree(mid);
+    }
+  }
+
+  // ---
+  // Split based on a histogram & column choice
+  private static class HistoSplit extends Split {
+    // INPUT - cleared after local work
+    DHisto2 _dh2;               // Histogram to split on
+    HistoSplit( DRFTree tree, int[] ends, DHisto2 dh2 ) { 
+      super(tree,ends); 
+      if( dh2._nbins < 2 ) throw H2O.unimpl(); // Nothing to split?
+      _dh2 = dh2;
+    }
+    // Split rows from beg to end
+    @Override void doSplit( LocalTree lt, int beg, int end ) {
+      int nbins = _dh2._nbins;
+      int nclass= _dh2._nclass;
+      // Get size of each bin, so we can get start of each split...
+      int idx = H2O.SELF.index();
+      int offs[] = new int[nbins];
+      for( int b=0; b<nbins; b++ )
+        offs[b] = _dh2._bins[b][idx];
+      // Roll up start point for each bin.  Fill in children.
+      _drf._kids = new DRFTree[nbins];
+      int off = beg;
+      for( int b=0; b<nbins; b++ ) {
+        _drf._kids[b] = new DRFTree(off);
+        int tmp = offs[b];
+        offs[b] = off;
+        off += tmp;
+      }
+
+      // Split based on min/step/max bins
+      Vec v0 = lt._fr._vecs[_dh2._col];
+      long[] rs0 = lt._rows0;
+      long[] rs1 = lt._rows1;
+      for( int i=beg; i<end; i++ ) {
+        long r = rs0[i];
+        float f = (float)v0.at(r);
+        int b = _dh2.bin(f);    // Which bin?  Linear interpolation.
+        rs1[offs[b]++] = r;
+      }
+      assert offs[nbins-1]==end : ""+Arrays.toString(offs)+", end="+end;
+
+      // Performance wart: should/could flip back and forth between rows0 & rows1
+      System.arraycopy(rs1,beg,rs0,beg,(end-beg));
+      _dh2 = null;              // Do not pass this back
     }
   }
 
@@ -371,25 +575,31 @@ public class DRF extends Job {
   // for a single tree.
   private static class DHisto2 extends DRemoteTask<DHisto2> {
     public static final int BINS=4;
+    // INPUTS, cleared when done
     DRFTree _drf;         // Tree-leaf being histogramed
-    int[]   _ends;        // Endpoints for this leaf, per jvm
+    int[/*node*/] _ends;  // Endpoints for this leaf, per jvm
     final int _col;       // Column being histogramed
     final char _nbins;          // Number of bins 
+    final short _nclass;        // Number of classes (or 0 for regression)
     final float _min, _step;    // Column min/step, used for binning
+    // OUTPUTS, set locally, rolled-up
     float _mins[], _maxs[];     // min/max per-bin across the cluster
+    int _clss[/*bin*/][/*class*/]; // Class distribution, rolled-up across the cluster
+    int _bins[/*bin*/][/*node*/];  // Local (per-node) bin sizes
 
     // Build a basic histogram shell
-    DHisto2( DRFTree drf, int[] ends, int col, float min, float max, boolean isInt, String name ) {
+    DHisto2( DRFTree drf, int[] ends, short nclass, int col, float min, float max, boolean isInt, String name ) {
       assert drf._keys != null; // Have keys
       assert drf._kids == null; // No kids yet
       assert drf.check(ends);   // Quicky bounds check
-      assert max > min : "Caller ensures "+max+">"+min+", since if max==min== the column "+name+" is all constants";
+      assert max > min : "Caller ensures "+max+">"+min+", since if max==min the column "+name+" is all constants";
       int nelems=0;             // Count elements across the cluster in this split
       for( int i=0; i<ends.length; i++ )
         nelems += ends[i]-drf._begs[i];
       assert nelems > 0;        // Something to histogram
+      _drf  = drf;              // Tree node; LocalTree keys & beg points of row
       _ends = ends;             // Endpoints of rows
-      _col = col;               // Column being histogram
+      _col  = col;              // Column being histogram
 
       int xbins = Math.max(Math.min(BINS,nelems),1); // Default bin count
       // See if we can show there are fewer unique elements than nbins.
@@ -397,27 +607,40 @@ public class DRF extends Job {
       _nbins = (char)((isInt && max-min < xbins) 
                       ? ((long)max-(long)min+1L) // Shrink bins
                       : xbins); // Default size for most columns        
+      _nclass = nclass;
       _min=min; 
       _step = (max-min)/_nbins; // Step size for linear interpolation
-      System.out.println("bins="+(int)_nbins);
     }
 
     @Override public void lcompute() {
-      System.out.println("local compute bins="+(int)_nbins);
       int idx = H2O.SELF.index();
       LocalTree lt = DKV.get(_drf._keys[idx]).get();
       int beg = _drf._begs[idx];
       int end =      _ends[idx];
       _mins = new float[_nbins];  Arrays.fill(_mins, Float.MAX_VALUE);
-      _maxs = new float[_nbins];  Arrays.fill(_mins,-Float.MAX_VALUE);
+      _maxs = new float[_nbins];  Arrays.fill(_maxs,-Float.MAX_VALUE);
+      _clss = new int  [_nbins][_nclass];
       assert lt.isOrdered(beg,end);
       Vec v0 = lt._fr._vecs[_col];
+      Vec vy = lt._fr._vecs[lt._fr.numCols()-1]; // Response is last vec
+      int ymin = (int)vy.min();
 
       for( int i=beg; i<end; i++ ) {
-        float f = (float)v0.at(lt._rows[i]);
+        long r = lt._rows0[i];
+        float f = (float)v0.at (r);
+        int y   = (int)  vy.at8(r);
         int b = bin(f);         // Which bin?
         if( f < _mins[b] ) _mins[b] = f;
         if( f > _maxs[b] ) _maxs[b] = f;
+        _clss[b][y-ymin]++;     // Bump class histogram
+      }
+
+      // Roll-up class-counts to bin-counts for this node
+      _bins = new int[_nbins][H2O.CLOUD.size()];
+      for( int b=0; b<_nbins; b++ ) {
+        int sum=0;
+        for( int c=0; c<_nclass; c++ ) sum += _clss[b][c];
+        _bins[b][idx] = sum;
       }
 
       _drf = null;              // No need to pass DRFTree back
@@ -426,18 +649,86 @@ public class DRF extends Job {
     }
     // Combine min/max/class distributions from across the cluster
     @Override public void reduce(DHisto2 dh2) {
-      System.out.println("reduce, mins="+Arrays.toString(_mins));
       if( dh2 == null ) return;
-      for( int i=0; i<_nbins; i++ ) {
-        if( _mins[i] > dh2._mins[i] ) _mins[i] = dh2._mins[i];
-        if( _maxs[i] < dh2._maxs[i] ) _maxs[i] = dh2._maxs[i];
-      }
+      if( _mins==null ) copyOver(dh2);
+      else 
+        for( int i=0; i<_nbins; i++ ) {
+          if( _mins[i] > dh2._mins[i] ) _mins[i] = dh2._mins[i];
+          if( _maxs[i] < dh2._maxs[i] ) _maxs[i] = dh2._maxs[i];
+          for( int c=0; c<_nclass; c++ ) // Merge class distributions
+            _clss[i][c] += dh2._clss[i][c];
+          for( int j=0; j<H2O.CLOUD.size(); j++ )
+            _bins[i][j] += dh2._bins[i][j];
+        }
     }
 
+    // Convert a column value to a bin with simple linear interpolation
     int bin( float d ) {
       int idx1  = _step <= 0.0 ? 0 : (int)((d-_min)/_step);
       int idx2  = Math.max(Math.min(idx1,_nbins-1),0); // saturate at bounds
       return idx2;
+    }
+    // min/max from the histogram, skipping empty bins
+    float min() {
+      int mb=0;
+      while( _mins[mb] ==  Float.MAX_VALUE ) mb++;
+      return _mins[mb];
+    }
+    float max() {
+      int xb=_nbins-1;
+      while( _maxs[xb] == -Float.MAX_VALUE ) xb--;
+      return _maxs[xb];
+    }
+    
+    // After a histogram has been built, we can check to see if a split (or any
+    // following split) based on this histogram has any predictive power.  If
+    // min==max then the predictors are not helpful.  If some bins are empty,
+    // then again this does not help.  We will stop tracking these splits.
+    boolean constantPredictor() { return min() == max();  }
+
+    // Finally, if the response-variable is the same for the entire split,
+    // again splitting this column will not help.  Note that if the
+    // response-variable is the same for the whole split, we get zero error.
+    boolean constantResponse() {
+      int b=0;
+      while( _mins[b] ==  Float.MAX_VALUE ) b++;
+      // Find some class bit somewhere in the non-empty bin mb
+      int cidx=0;
+      while( _clss[b][cidx] == 0 ) cidx++;
+      // See if we got class bits in any other class bin
+      for( ; b < _nbins; b++ )
+        for( int c=0; c<_nclass; c++ )
+          if( _clss[b][c] > 0 && c != cidx ) return false;
+      return true;
+    }
+
+    // Compute a "score" for a column; lower score "wins" (is a better split).
+    // Score for a Classification tree is sum of the errors per-class.  We
+    // predict a row using the ratio of the response class to all the rows in
+    // the split.
+    //
+    // Example: we have 10 rows, classed as 8 C0's, 1 C1's and 1 C2's.  The
+    // C0's are all predicted as "80% C0".  We have 8 rows which are 80%
+    // correctly C0, and 2 rows which are 10% correct.  The total error is
+    // 8*(1-.8)+2*(1-.1) = 3.4.
+    //
+    // Example: we have 10 rows, classed as 6 C0's, 2 C1's and 2 C2's.  Total
+    // error is: 6*(1-.6)+4*(1-.2) = 5.6
+    float scoreClassification( ) {
+      float sum = 0;
+      for( int b=0; b<_nbins; b++ ) {
+        // A little algebra, and the math we need is:
+        //    N - (sum(clss^2)/N)
+        long cnt=0, err=0;
+        for( int j=0; j<_nclass; j++ ) {
+          long c = _clss[b][j];
+          cnt += c;
+          err += c*c;
+        }
+        if( cnt > 0 )
+          sum += (float)cnt - ((float)err/cnt);
+      }
+      return sum;
     }
   }
 
@@ -447,7 +738,8 @@ public class DRF extends Job {
   private static class LocalTree extends Iced {
     final Key _key;             // A unique cookie for this datastructure
     final Frame _fr;            // Frame for the tree being built
-    final long [] _rows;        // All the local datarows
+    final long [] _rows0;       // All the local datarows
+    final long [] _rows1;       // Double-buffered for easier splitting
     LocalTree( Key key, Frame fr ) {
       _key = key;
       _fr = fr;
@@ -460,7 +752,8 @@ public class DRF extends Job {
       if( sum >= Integer.MAX_VALUE ) throw H2O.unimpl(); // More than 2bil rows per node?
       
       // Get space for 'em
-      _rows = MemoryManager.malloc8((int)sum);
+      _rows0 = MemoryManager.malloc8((int)sum);
+      _rows1 = MemoryManager.malloc8((int)sum);
       
       // Fill in the rows this Node will work on
       int k=0;
@@ -468,21 +761,26 @@ public class DRF extends Job {
         if( v0.chunkKey(i).home() ) {
           long end = v0.chunk2StartElem(i+1);
           for( long j=v0.chunk2StartElem(i); j<end; j++ )
-            _rows[k++] = j;
+            _rows0[k++] = j;
       }    
-      assert isOrdered(0,_rows.length);
+      assert isOrdered(0,_rows0.length);
     }
-    void swap( int i, int j ) { long tmp = _rows[i]; _rows[i] = _rows[j]; _rows[j] = tmp; }
 
     private boolean isOrdered( int beg, int end ) {
       if( beg == end ) return true;
-      long r = _rows[beg];
+      long r = _rows0[beg];
       for( int i = beg+1; i<end; i++ ) {
-        long s = _rows[i];
-        if( r > s ) return false;
+        long s = _rows0[i];
+        if( r > s ) { System.out.println("OOO: "+r+" "+s); return false;  }
         r = s;
       }
       return true;
     }
   }
+
+  static void swap( byte  bs[], int i, int j ) { byte  tmp = bs[i]; bs[i] = bs[j]; bs[j] = tmp; }
+  static void swap( int   is[], int i, int j ) { int   tmp = is[i]; is[i] = is[j]; is[j] = tmp; }
+  static void swap( float fs[], int i, int j ) { float tmp = fs[i]; fs[i] = fs[j]; fs[j] = tmp; }
+  static void swap( long  ls[], int i, int j ) { long  tmp = ls[i]; ls[i] = ls[j]; ls[j] = tmp; }
+
 }
