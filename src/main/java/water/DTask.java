@@ -39,6 +39,9 @@ public abstract class DTask<T extends DTask> extends H2OCountedCompleter impleme
    */
   public void onAckAck() {}
 
+  /** Override to remove 2 lines of logging per RPC. */
+  public boolean logVerbose() { return true; }
+
   // The abstract methods to be filled in by subclasses.  These are automatically
   // filled in by any subclass of DTask during class-load-time, unless one
   // is already defined.  These methods are NOT DECLARED ABSTRACT, because javac

@@ -308,7 +308,7 @@ public class DRF extends Job {
         int col = cols[cidx];
         DHisto2 dh2 = new DHisto2(this,ends,nclass,col,mins[cidx],maxs[cidx],fr._vecs[col]._isInt,fr._names[col]);
         float f = dh2.invokeOnAllNodes().scoreClassification();
-        // Tigthen mins & maxs based on what is discovered
+        // Tighten mins & maxs based on what is discovered
         float min = dh2.min();  if( min > mins[cidx] ) mins[cidx] = min;
         float max = dh2.max();  if( max < maxs[cidx] ) maxs[cidx] = max;
 
@@ -655,6 +655,12 @@ public class DRF extends Job {
       _ends = null;             // No need to pass ends back
       tryComplete();
     }
+    // Combine Key/beg lists from across the cluster
+    @Override public void reduce(Split spl) {
+      if( spl == null ) return;
+      if( _drf == null ) _drf = spl._drf;
+      else _drf.add2(spl._drf);
+    }
   }
 
   // ---
@@ -695,12 +701,6 @@ public class DRF extends Job {
       _drf._kids    = new DRFTree[2];
       _drf._kids[0] = new DRFTree(beg);
       _drf._kids[1] = new DRFTree(mid);
-    }
-    // Combine Key/beg lists from across the cluster
-    @Override public void reduce(SampleSplit spl) {
-      if( spl == null ) return;
-      if( _drf == null ) _drf = spl._drf;
-      else _drf.add2(spl._drf);
     }
   }
 
@@ -749,7 +749,7 @@ public class DRF extends Job {
       System.arraycopy(rs1,beg,rs0,beg,(end-beg));
       _dh2 = null;              // Do not pass this back
     }
-    @Override public void reduce(HistoSplit spl) { }
+    @Override public boolean logVerbose() { return false; }
   }
 
   // ---
@@ -869,10 +869,26 @@ public class DRF extends Job {
       Vec vy = lt._fr._vecs[lt._fr.numCols()-1]; // Response is last vec
       int ymin = (int)vy.min();
 
+      // Get the chunks we're working out of
+      long r0 = lt._rows0[beg];
+      Chunk c0 = v0.chunk(r0);
+      Chunk cy = vy.chunk(r0);
+      assert c0._start==cy._start;
+      assert c0._len  ==cy._len  ;
+      long cbeg = c0._start;
+      long cend = cbeg+c0._len;
+
+      // Visit all rows, chunk by chunk
       for( int i=beg; i<end; i++ ) {
         long r = lt._rows0[i];
-        float f = (float)v0.at (r);
-        int y   = (int)  vy.at8(r);
+        if( r >= cend ) {
+          c0 = v0.chunk(r);
+          cy = vy.chunk(r);
+          cbeg = c0._start;
+          cend = cbeg+c0._len;
+        }
+        float f = (float)c0.at0 ((int)(r-cbeg));
+        int y   = (int)  cy.at80((int)(r-cbeg));
         int b = bin(f);         // Which bin?
         if( f < _mins[b] ) _mins[b] = f;
         if( f > _maxs[b] ) _maxs[b] = f;
@@ -974,6 +990,7 @@ public class DRF extends Job {
       }
       return sum;
     }
+    @Override public boolean logVerbose() { return false; }
   }
 
   // --------------------------------------------------------------------------
@@ -1014,7 +1031,10 @@ public class DRF extends Job {
       long r = _rows0[beg];
       for( int i = beg+1; i<end; i++ ) {
         long s = _rows0[i];
-        if( r > s ) { System.out.println("OOO: "+r+" "+s); return false;  }
+        if( r > s ) { 
+          System.out.println("Out-Of-Order beg="+beg+" : i-1,i="+i+" : end="+end+", ("+r+" <= "+s+")"); 
+          return false;  
+        }
         r = s;
       }
       return true;
