@@ -27,7 +27,7 @@ public class DRF extends Job {
     final DRF job = new DRF(dest, fr);
     H2O.submitTask(job.start(new H2OCountedCompleter() {
         @Override public void compute2() { job.run(fr,maxDepth,ntrees,mtrys,(float)sampleRate,seed); tryComplete(); }
-      })); 
+      }));
     return job;
   }
 
@@ -243,7 +243,7 @@ public class DRF extends Job {
 
     // Called to make a Root DRFTree.  Passed in a key, and the length of the
     // entire row list.  Sets the Key list.
-    DRFTree( Key key, int end ) { 
+    DRFTree( Key key, int end ) {
       _keys = new Key[H2O.CLOUD.size()];
       _begs = new int[_keys.length];
       int idx = H2O.SELF.index();
@@ -261,7 +261,7 @@ public class DRF extends Job {
     }
 
     // Called to make a new interior DRFTree.  Just a row start.
-    DRFTree( int beg ) { 
+    DRFTree( int beg ) {
       _begs = new int[H2O.CLOUD.size()];
       int idx = H2O.SELF.index();
       _begs[idx] = beg;
@@ -292,7 +292,7 @@ public class DRF extends Job {
     // each of the several splits.
     void doSplit(Frame fr, int ends[/*nodes*/], int cols[/*cols*/], float mins[/*cols*/], float maxs[/*cols*/], Random rand, int mtrys, int depth, int maxDepth, short nclass) {
       if( depth >= maxDepth ) return;
-      
+
       // We pick up to mtrys columns, pulling at random without replacement
       // from the entire list of columns.  Picked columns are moved to the end
       // of the column list, and are not picked again.
@@ -407,7 +407,7 @@ public class DRF extends Job {
       for( int i=0; i<ends.length; i++ )
         if( _begs[i] > ends[i] )
           return false;
-      return true; 
+      return true;
     }
 
     // Pretty-print
@@ -464,7 +464,7 @@ public class DRF extends Job {
     //     +1b * nclasses, 1 byte per class
     //  +1b 255 - Has class distribution in ints
     //     +4b * nclasses, 1 int per class
-    public AutoBuffer compact( AutoBuffer ab, int id, long seed ) { 
+    public AutoBuffer compact( AutoBuffer ab, int id, long seed ) {
       return _kids[0].compact(ab.put4(id).put8(seed));
     }
     private AutoBuffer compact( AutoBuffer ab ) {
@@ -516,7 +516,7 @@ public class DRF extends Job {
         for( int i=0; i<_kids.length; i++ ) {
           if( _kids[i].noPrediction() ) continue;
           int szk = _kids[i].size();
-          if( i<last ) 
+          if( i<last )
             sz += 4/*Float bin-max*/ + (szk <= 254 ? 1 : 4)/*skip size*/;
           sz += szk; // Subtree bytes
         }
@@ -568,7 +568,7 @@ public class DRF extends Job {
       nodes++;
       if( depth > maxd ) maxd = depth;
       int nbin = bits[idx++]&0xFF;
-      if( nbin == 0 || nbin==255 ) 
+      if( nbin == 0 || nbin==255 )
         return merge_d_n(maxd,nodes);
       idx += 2;                 // Column
       while( nbin > 1 ) {
@@ -622,11 +622,11 @@ public class DRF extends Job {
     // Subclass provided function describing the split decision
     abstract void doSplit(LocalTree lt, int beg, int end);
 
-    Split( DRFTree drf, int[] ends ) { 
+    Split( DRFTree drf, int[] ends ) {
       assert drf._keys != null; // These where cleaned out last pass, make sure they got back
       assert drf._kids == null; // No kids yet
       assert drf.check(ends);   // Quicky bounds check
-      _drf  = drf; 
+      _drf  = drf;
       _ends = ends;
     }
     @Override public void lcompute() {
@@ -670,8 +670,8 @@ public class DRF extends Job {
     // INPUTS
     final double _sampleRate;
     final long _seed;
-    SampleSplit( DRFTree root, int[] ends, double sampleRate, long seed ) { 
-      super(root,ends); 
+    SampleSplit( DRFTree root, int[] ends, double sampleRate, long seed ) {
+      super(root,ends);
       _sampleRate = sampleRate;
       _seed = seed;
     }
@@ -709,8 +709,8 @@ public class DRF extends Job {
   private static class HistoSplit extends Split<HistoSplit> {
     // INPUT - cleared after local work
     DHisto2 _dh2;               // Histogram to split on
-    HistoSplit( DRFTree tree, int[] ends, DHisto2 dh2 ) { 
-      super(tree,ends); 
+    HistoSplit( DRFTree tree, int[] ends, DHisto2 dh2 ) {
+      super(tree,ends);
       if( dh2._nbins < 2 ) throw H2O.unimpl(); // Nothing to split?
       _dh2 = dh2;
     }
@@ -805,9 +805,9 @@ public class DRF extends Job {
       _fr = null;
       tryComplete();
     }
-    @Override public void reduce(OOBEETask cm) { 
+    @Override public void reduce(OOBEETask cm) {
       if( _cm == null ) _cm = cm._cm;
-      else if( cm._cm != null ) 
+      else if( cm._cm != null )
         for( int i=0; i<_cm.length; i++ )
           for( int j=0; j<_cm.length; j++ )
             _cm[i][j] += cm._cm[i][j];
@@ -823,7 +823,7 @@ public class DRF extends Job {
     DRFTree _drf;         // Tree-leaf being histogramed
     int[/*node*/] _ends;  // Endpoints for this leaf, per jvm
     final int _col;       // Column being histogramed
-    final char _nbins;          // Number of bins 
+    final char _nbins;          // Number of bins
     final short _nclass;        // Number of classes (or 0 for regression)
     final float _min, _step;    // Column min/step, used for binning
     // OUTPUTS, set locally, rolled-up
@@ -848,11 +848,11 @@ public class DRF extends Job {
       int xbins = Math.max(Math.min(BINS,nelems),1); // Default bin count
       // See if we can show there are fewer unique elements than nbins.
       // Common for e.g. boolean columns, or near leaves.
-      _nbins = (char)((isInt && max-min < xbins) 
+      _nbins = (char)((isInt && max-min < xbins)
                       ? ((long)max-(long)min+1L) // Shrink bins
-                      : xbins); // Default size for most columns        
+                      : xbins); // Default size for most columns
       _nclass = nclass;
-      _min=min; 
+      _min=min;
       _step = (max-min)/_nbins; // Step size for linear interpolation
     }
 
@@ -870,29 +870,31 @@ public class DRF extends Job {
       int ymin = (int)vy.min();
 
       // Get the chunks we're working out of
-      long r0 = lt._rows0[beg];
-      Chunk c0 = v0.chunk(r0);
-      Chunk cy = vy.chunk(r0);
-      assert c0._start==cy._start;
-      assert c0._len  ==cy._len  ;
-      long cbeg = c0._start;
-      long cend = cbeg+c0._len;
+      if( end > beg ) {
+        long r0 = lt._rows0[beg];
+        Chunk c0 = v0.chunk(r0);
+        Chunk cy = vy.chunk(r0);
+        assert c0._start==cy._start;
+        assert c0._len  ==cy._len  ;
+        long cbeg = c0._start;
+        long cend = cbeg+c0._len;
 
-      // Visit all rows, chunk by chunk
-      for( int i=beg; i<end; i++ ) {
-        long r = lt._rows0[i];
-        if( r >= cend ) {
-          c0 = v0.chunk(r);
-          cy = vy.chunk(r);
-          cbeg = c0._start;
-          cend = cbeg+c0._len;
+        // Visit all rows, chunk by chunk
+        for( int i=beg; i<end; i++ ) {
+          long r = lt._rows0[i];
+          if( r >= cend ) {
+            c0 = v0.chunk(r);
+            cy = vy.chunk(r);
+            cbeg = c0._start;
+            cend = cbeg+c0._len;
+          }
+          float f = (float)c0.at0 ((int)(r-cbeg));
+          int y   = (int)  cy.at80((int)(r-cbeg));
+          int b = bin(f);         // Which bin?
+          if( f < _mins[b] ) _mins[b] = f;
+          if( f > _maxs[b] ) _maxs[b] = f;
+          _clss[b][y-ymin]++;     // Bump class histogram
         }
-        float f = (float)c0.at0 ((int)(r-cbeg));
-        int y   = (int)  cy.at80((int)(r-cbeg));
-        int b = bin(f);         // Which bin?
-        if( f < _mins[b] ) _mins[b] = f;
-        if( f > _maxs[b] ) _maxs[b] = f;
-        _clss[b][y-ymin]++;     // Bump class histogram
       }
 
       // Roll-up class-counts to bin-counts for this node
@@ -911,7 +913,7 @@ public class DRF extends Job {
     @Override public void reduce(DHisto2 dh2) {
       if( dh2 == null ) return;
       if( _mins==null ) copyOver(dh2);
-      else 
+      else
         for( int i=0; i<_nbins; i++ ) {
           if( _mins[i] > dh2._mins[i] ) _mins[i] = dh2._mins[i];
           if( _maxs[i] < dh2._maxs[i] ) _maxs[i] = dh2._maxs[i];
@@ -939,7 +941,7 @@ public class DRF extends Job {
       while( _maxs[xb] == -Float.MAX_VALUE ) xb--;
       return _maxs[xb];
     }
-    
+
     // After a histogram has been built, we can check to see if a split (or any
     // following split) based on this histogram has any predictive power.  If
     // min==max then the predictors are not helpful.  If some bins are empty,
@@ -1010,11 +1012,11 @@ public class DRF extends Job {
         if( v0.chunkKey(i).home() )
           sum += v0.chunk2StartElem(i+1)-v0.chunk2StartElem(i);
       if( sum >= Integer.MAX_VALUE ) throw H2O.unimpl(); // More than 2bil rows per node?
-      
+
       // Get space for 'em
       _rows0 = MemoryManager.malloc8((int)sum);
       _rows1 = MemoryManager.malloc8((int)sum);
-      
+
       // Fill in the rows this Node will work on
       int k=0;
       for( int i=0; i<nchunks; i++ )
@@ -1022,7 +1024,7 @@ public class DRF extends Job {
           long end = v0.chunk2StartElem(i+1);
           for( long j=v0.chunk2StartElem(i); j<end; j++ )
             _rows0[k++] = j;
-      }    
+      }
       assert isOrdered(0,_rows0.length);
     }
 
@@ -1031,9 +1033,9 @@ public class DRF extends Job {
       long r = _rows0[beg];
       for( int i = beg+1; i<end; i++ ) {
         long s = _rows0[i];
-        if( r > s ) { 
-          System.out.println("Out-Of-Order beg="+beg+" : i-1,i="+i+" : end="+end+", ("+r+" <= "+s+")"); 
-          return false;  
+        if( r > s ) {
+          System.out.println("Out-Of-Order beg="+beg+" : i-1,i="+i+" : end="+end+", ("+r+" <= "+s+")");
+          return false;
         }
         r = s;
       }
