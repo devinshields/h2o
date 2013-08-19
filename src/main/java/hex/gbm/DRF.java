@@ -176,7 +176,7 @@ public class DRF extends Job {
     // Split the top-level tree based on random sampling.
     // root._kids[0] will be sampled-in, and root._kids[1] will be sampled-out
     final long seed = seeds[tnum];
-    new SampleSplit(root,ends,sampleRate,seed).invokeOnAllNodes();
+    new SampleSplit(keys,root._begs,ends,sampleRate,seed).invokeOnAllNodes().makeKids(root);    
     DRFTree train = root._kids[0];
     DRFTree test  = root._kids[1];
     train._keys = keys;         // Put these back (not passed back)
@@ -231,15 +231,15 @@ public class DRF extends Job {
   // large LocalTree here.
   private static class DRFTree extends Iced {
     // INPUTS, cleared when done
-    Key _keys[/*nodes*/];      // Keys for local data for this one tree
+    Key _keys[/*nodes*/];    // Keys for local data for this one tree
     // INPUT/OUTPUT - output/set on 1st pass, input thereafter
-    int _begs[];               // Beginning-row for this tree leaf, for all nodes
+    int _begs[];             // Beginning-row for this tree leaf, for all nodes
     // OUTPUT - set after splitting decisions
-    int _col;              // Column to split on
-    float _min, _step;     // lower-bound & step size for which kid
-    DRFTree _kids[];       // Kids, if any.
-    int _clss[/*nclass*/]; // Class distribution at leaves, or null in the interior
-    transient int _byteSize;    // Compacted size
+    int _col;                // Column to split on
+    float _min, _step;       // lower-bound & step size for which kid
+    DRFTree _kids[];         // Kids, if any.
+    int _clss[/*nclass*/];   // Class distribution at leaves, or null in the interior
+    transient int _byteSize; // Compacted size
 
     // Called to make a Root DRFTree.  Passed in a key, and the length of the
     // entire row list.  Sets the Key list.
@@ -260,26 +260,8 @@ public class DRF extends Job {
         }
     }
 
-    // Called to make a new interior DRFTree.  Just a row start.
-    DRFTree( int beg ) {
-      _begs = new int[H2O.CLOUD.size()];
-      int idx = H2O.SELF.index();
-      _begs[idx] = beg;
-    }
-    // Merge trees on interior DRFTree nodes.
-    // Merge all the kid-tree starts
-    void add2( DRFTree drf ) {
-      if( drf._kids == null ) return;
-      if( _kids == null ) _kids = drf._kids;
-      else for( int i=0; i<_kids.length; i++ )
-             _kids[i].add3(drf._kids[i]);
-    }
-    void add3( DRFTree drf ) {
-      assert _kids==null;
-      for( int i=0; i<_begs.length; i++ )
-        if( drf._begs[i] != 0 )
-          _begs[i] = drf._begs[i];
-    }
+    // Called to make a new interior DRFTree.  Just the row starts.
+    DRFTree( int begs[] ) { _begs = begs; }
 
     // ---
     // Build a tree level.  Passed in a set of active columns, and their min/max's.
@@ -359,7 +341,7 @@ public class DRF extends Job {
 
       // (3) split rows based on best histogram/column
       Key keys[] = _keys;       // Save for the kids
-      new HistoSplit(this,ends,best_hist).invokeOnAllNodes();
+      new HistoSplit(_keys,_begs,ends,best_hist).invokeOnAllNodes().makeKids(this);
 
       // (4) recursively compute new levels
       int nkids = best_hist._nbins;
@@ -617,23 +599,25 @@ public class DRF extends Job {
   // the end.  The actual rows are kept in the giant LocalTree array on each Node.
   private static abstract class Split<T extends Split> extends DRemoteTask<T> {
     // INPUT - cleared after local work
-    DRFTree _drf;               // The guy being split
-    int _ends[];                // Ends of split rows
+    Key _keys[/*nodes*/];    // Keys for local data for this one tree
+    // INPUT/OUTPUT - output/set on 1st pass, input thereafter
+    int _begs[/*nodes*/];    // Beginning-row for this tree leaf, for all nodes
+    int _ends[/*nodes*/];    // Ends of split rows
+    // OUTPUT
+    int _kids[/*nkids*/][/*nodes*/];
     // Subclass provided function describing the split decision
     abstract void doSplit(LocalTree lt, int beg, int end);
 
-    Split( DRFTree drf, int[] ends ) {
-      assert drf._keys != null; // These where cleaned out last pass, make sure they got back
-      assert drf._kids == null; // No kids yet
-      assert drf.check(ends);   // Quicky bounds check
-      _drf  = drf;
+    Split( Key keys[], int begs[], int[] ends ) {
+      _keys = keys;
+      _begs = begs;
       _ends = ends;
     }
     @Override public void lcompute() {
       int idx = H2O.SELF.index();
-      LocalTree lt = DKV.get(_drf._keys[idx]).get();
-      int beg = _drf._begs[idx];
-      int end =      _ends[idx];
+      LocalTree lt = DKV.get(_keys[idx]).get();
+      int beg = _begs[idx];
+      int end = _ends[idx];
       // Ordered before the split, so the split can do efficient visitation
       assert lt.isOrdered(beg,end) : "Not ordered";
 
@@ -641,25 +625,35 @@ public class DRF extends Job {
 
       // Children (if any) are ordered after the split, so the next split layer
       // starts ordered
-      if( _drf._kids != null ) {
+      if( _kids != null ) {
         int x = end;
-        for( int i=_drf._kids.length-1; i>=0; i-- ) {
-          int b = _drf._kids[i]._begs[idx];
+        for( int i=_kids.length-1; i>=0; i-- ) {
+          int b = _kids[i][idx];
           assert lt.isOrdered(b,x);
           x = b;
         }
       }
 
-      _drf._keys = null;        // No need to pass Keys back
-      _drf._begs = null;        // No need to pass begs back
+      _keys = null;             // No need to pass Keys back
+      _begs = null;             // No need to pass begs back
       _ends = null;             // No need to pass ends back
       tryComplete();
     }
     // Combine Key/beg lists from across the cluster
     @Override public void reduce(Split spl) {
       if( spl == null ) return;
-      if( _drf == null ) _drf = spl._drf;
-      else _drf.add2(spl._drf);
+      if( _kids == null ) _kids = spl._kids;
+      else for( int k=0; k<_kids.length; k++ )
+             for( int i=0; i<_kids[k].length; i++ )
+               if( spl._kids[k][i] != 0 )
+                 _kids[k][i] = spl._kids[k][i];
+    }
+
+    public void makeKids( DRFTree drf ) {
+      assert drf._kids == null;
+      drf._kids = new DRFTree[_kids.length];
+      for( int k=0; k<_kids.length; k++ )
+        drf._kids[k] = new DRFTree(_kids[k]);
     }
   }
 
@@ -670,8 +664,8 @@ public class DRF extends Job {
     // INPUTS
     final double _sampleRate;
     final long _seed;
-    SampleSplit( DRFTree root, int[] ends, double sampleRate, long seed ) {
-      super(root,ends);
+    SampleSplit( Key keys[], int begs[], int[] ends, double sampleRate, long seed ) {
+      super(keys,begs,ends);
       _sampleRate = sampleRate;
       _seed = seed;
     }
@@ -698,9 +692,11 @@ public class DRF extends Job {
       // Performance wart: should/could flip back and forth between rows0 & rows1
       System.arraycopy(rs1,beg,rs0,beg,(end-beg));
 
-      _drf._kids    = new DRFTree[2];
-      _drf._kids[0] = new DRFTree(beg);
-      _drf._kids[1] = new DRFTree(mid);
+      // Fill in the ranges for the split
+      int idx = H2O.SELF.index();
+      _kids = new int[2][_begs.length];
+      _kids[0][idx] = beg;
+      _kids[1][idx] = mid;
     }
   }
 
@@ -709,8 +705,8 @@ public class DRF extends Job {
   private static class HistoSplit extends Split<HistoSplit> {
     // INPUT - cleared after local work
     DHisto2 _dh2;               // Histogram to split on
-    HistoSplit( DRFTree tree, int[] ends, DHisto2 dh2 ) {
-      super(tree,ends);
+    HistoSplit( Key keys[], int begs[], int[] ends, DHisto2 dh2 ) {
+      super(keys,begs,ends);
       if( dh2._nbins < 2 ) throw H2O.unimpl(); // Nothing to split?
       _dh2 = dh2;
     }
@@ -724,10 +720,10 @@ public class DRF extends Job {
       for( int b=0; b<nbins; b++ )
         offs[b] = _dh2._bins[b][idx];
       // Roll up start point for each bin.  Fill in children.
-      _drf._kids = new DRFTree[nbins];
+      _kids = new int[nbins][_begs.length];
       int off = beg;
       for( int b=0; b<nbins; b++ ) {
-        _drf._kids[b] = new DRFTree(off);
+        _kids[b][idx] = off;
         int tmp = offs[b];
         offs[b] = off;
         off += tmp;
