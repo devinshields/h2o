@@ -75,14 +75,20 @@ public class GBMTest extends TestUtil {
       long seed = (1L<<32)|2;
 
       DRF drf = DRF.start(DRF.makeKey(),fr,/*maxdepth*/50,/*ntrees*/5,mtrys,/*sampleRate*/0.67,seed);
-      drf.get();                  // Block for result
+      drf.get();                // Block for result
       UKV.remove(drf.destination_key);
+
+      // Remove the forest model
+      Key forestKey = drf._forestKey;
+      DRF.Forest forest = UKV.get(forestKey);
+      forest.deleteKeys();
+      UKV.remove(forestKey);
     } finally {
       UKV.remove(dest);
     }
   }
 
-  /*@Test*/ public void testCovtypeDRF() {
+  @Test public void testCovtypeDRF() {
     File file = TestUtil.find_test_file("../datasets/UCI/UCI-large/covtype/covtype.data");
     if( file == null ) return;  // Silently abort test if the large covtype is missing
     Key fkey = NFSFileVec.make(file);
@@ -112,6 +118,13 @@ public class GBMTest extends TestUtil {
       DRF drf = DRF.start(DRF.makeKey(),fr,/*maxdepth*/50,/*ntrees*/5,mtrys,/*sampleRate*/0.67,seed);
       drf.get();                  // Block for result
       UKV.remove(drf.destination_key);
+
+      // Remove the forest model
+      Key forestKey = drf._forestKey;
+      DRF.Forest forest = UKV.get(forestKey);
+      forest.deleteKeys();
+      UKV.remove(forestKey);
+
     } finally {
       UKV.remove(dest);
     }

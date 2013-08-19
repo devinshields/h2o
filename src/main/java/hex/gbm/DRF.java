@@ -14,8 +14,8 @@ import water.util.Utils;
 public class DRF extends Job {
   public static final String KEY_PREFIX = "__DRFModel_";
 
-  // The Key of Trees
-  public Key _treeKey;
+  // The Key of the Forest
+  public Key _forestKey;
 
   long _cm[/*actual*/][/*predicted*/]; // Confusion matrix
   public long[][] cm() { return _cm; }
@@ -60,16 +60,16 @@ public class DRF extends Job {
 
     // Make a master list of trees to be worked on.
     // Make a deterministic set of RNG seeds used to pick split columns.
-    final Trees trees = new Trees(ncols, ntrees,Utils.getRNG(seed));
-    _treeKey = Key.make(Key.make().toString(),(byte)0,Key.BUILT_IN_KEY);
-    UKV.put(_treeKey,trees);
+    final Forest forest = new Forest(ncols, ymin, nclass, ntrees,Utils.getRNG(seed));
+    _forestKey = Key.make(Key.make().toString(),(byte)0,Key.BUILT_IN_KEY);
+    UKV.put(_forestKey,forest);
 
     // Get Nodes busy making trees.
     new DRemoteTask() {
       @Override public void lcompute() {
-        int tree;
-        while( (tree = ((GetOne)new GetOne().invoke(_treeKey))._tree) != -1 )
-          doTree(fr,nclass,maxDepth,mtrys,sampleRate,trees._seeds[tree],tree);
+        int tnum;
+        while( (tnum = ((GetOne)new GetOne().invoke(_forestKey))._tnum) != -1 )
+          doTree(_forestKey,fr,nclass,maxDepth,mtrys,sampleRate,forest._seeds,tnum);
         tryComplete();
       }
       @Override public void reduce(DRemoteTask drt) { }
@@ -77,77 +77,111 @@ public class DRF extends Job {
 
     // Get the updated list
     System.out.println("All trees done! "+t_drf);
-    Trees trees2 = UKV.get(_treeKey);
 
+    Forest forest2 = UKV.get(_forestKey);
+    // Compute a OOBEE Confusion Matrix
+    _cm = new OOBEETask(forest2,sampleRate,fr).invokeOnAllNodes()._cm;
     System.out.println("Confusion Matrix ");
-    long[][] cm = trees2.score(fr);
-    for( long ls[] : cm )
+    for( long ls[] : _cm )
       System.out.println(Arrays.toString(ls));
 
-    UKV.remove(_treeKey);
-    System.out.println(trees2);
+    System.out.println(forest2);
   }
 
   // Master list of tree-seeds, and which trees are being worked on.
   // This list is atomically updated by nodes as they work on trees.
-  private static class Trees extends Iced {
+  public static class Forest extends Iced/*should be an H2O Model class*/ {
     final int _ncols;           // Number of columns in the model
+    final int _ymin;            // Smallest class used to model with
+    final int _nclass;          // Number of classes from ymin to ymin+_nclass-1
     final long [] _seeds;       // Random gen seeds per-tree
     final Key [] _treeKeys;     // Tree Keys, set as trees are completed
     int _next;                  // Next un-owned tree-gen
-    Trees( int ncols, int ntrees, Random rand ) {
-      _ncols = ncols;
+    Forest( int ncols, int ymin, int nclass, int ntrees, Random rand ) {
+      _ncols = ncols;  _ymin = ymin;  _nclass = nclass;
       _treeKeys = new Key[ntrees];
       _seeds = new long[ntrees];
       for( int i=0; i<ntrees; i++ )
         _seeds[i] = rand.nextLong();
     }
-
-    // Gather the trees all locally
-    void gather() {
-      for( Key k : _treeKeys ) {
-      }
+    public void deleteKeys() {
+      Futures fs = new Futures();
+      for( Key k : _treeKeys ) UKV.remove(k,fs);
+      fs.blockForPending();
     }
 
-    // Score a dataset; returns a CM
-    long[][] score( Frame fr ) {
-      assert fr.numCols()==_ncols;
+    // Compute Model stats; tree size, depth, nodes
+    transient long _t_bytes, _t_depth, _t_nodes;
+    public long t_bytes() { return _t_bytes == 0 ? modelStats()._t_bytes : _t_bytes; }
+    public long t_depth() { return _t_depth == 0 ? modelStats()._t_depth : _t_depth; }
+    public long t_nodes() { return _t_nodes == 0 ? modelStats()._t_nodes : _t_nodes; }
+    private Forest modelStats() {
+      for( int i=0; i<_treeKeys.length; i++ ) {
+        Key k = _treeKeys[i];
+        byte[] bits = DKV.get(k).getBytes();
+        assert UDP.get4(bits,0/*tree id*/)==i; // Check tree-bits for sane ID's
+        long d_n = DRFTree.stats(bits);
+        int depth = (int)(d_n>>32);
+        int nodes = (int)(d_n    );
+        _t_bytes += bits.length;
+        _t_depth += depth;
+        _t_nodes += nodes;
+      }
+      return this;
+    }
 
-      return null;
+    @Override public String toString() {
+      return "Trees#"+_treeKeys.length+
+        ", avg bytes="+(t_bytes()/_treeKeys.length)+
+        ", avg nodes="+(t_nodes()/_treeKeys.length)+
+        ", max depth="+(t_depth()/_treeKeys.length);
     }
   }
 
   // Atomically fetch a tree# to work on & claim it, or return -1.
-  private static class GetOne extends TAtomic<Trees> {
-    int _tree = -1;
-    @Override public Trees atomic( Trees old ) {
+  private static class GetOne extends TAtomic<Forest> {
+    int _tnum = -1;
+    @Override public Forest atomic( Forest old ) {
       if( old._next >= old._seeds.length ) return null;
-      _tree = old._next++;
+      _tnum = old._next++;
+      return old;
+    }
+  }
+
+  private static class SetOne extends TAtomic<Forest> {
+    final int _tnum;
+    Key _treeKey;
+    SetOne( int tnum, Key treeKey ) { _tnum = tnum; _treeKey = treeKey; }
+    @Override public Forest atomic( Forest old ) {
+      assert old._treeKeys[_tnum] == null : "Need to ignore & free extra dup tree";
+      old._treeKeys[_tnum] = _treeKey;
       return old;
     }
   }
 
   // --------------------------------------------------------------------------
   // Compute a single RF tree
-  private void doTree( final Frame fr, final short nclass, final int maxDepth, final int mtrys, final double sampleRate, long seed, int tree) {
+  private static void doTree( Key forestKey, Frame fr, short nclass, int maxDepth, int mtrys, float sampleRate, long seeds[], int tnum ) {
     Timer t_tree = new Timer();
-    System.out.println("Working on tree "+tree);
+    System.out.println("Working on tree "+tnum);
 
     // Ask all Nodes to setup for building this one tree, and hand me back a
     // cookie (Key) to guide further tree building.
     DRFTree root = new Start1Tree(fr).invokeOnAllNodes()._drf;
     // Capture and reset root info
-    final int[] ends = root._begs;   root._begs = new int[ends.length];
+    final int[] ends = root._begs;
+    root._begs = new int[ends.length];
     Key keys[] = root._keys;
 
     // Split the top-level tree based on random sampling.
     // root._kids[0] will be sampled-in, and root._kids[1] will be sampled-out
+    final long seed = seeds[tnum];
     new SampleSplit(root,ends,sampleRate,seed).invokeOnAllNodes();
-    DRFTree root0 = root._kids[0];
-    DRFTree root1 = root._kids[1];
-    root0._keys = keys;         // Put these back (not passed back)
-    // End of tree 'root0' is also the beginning of tree 'root1'.
-    final int[] ends0 = root1._begs;
+    DRFTree train = root._kids[0];
+    DRFTree test  = root._kids[1];
+    train._keys = keys;         // Put these back (not passed back)
+    // End of tree 'train' is also the beginning of tree 'test'.
+    final int[] ends0 = test._begs;
 
     // Build an initial set of columns to begin tree-splitting on
     int ncols=fr.numCols()-1;   // Last column is response
@@ -173,17 +207,22 @@ public class DRF extends Job {
     Random rand = Utils.getRNG(seed2);
 
     // build a tree
-    root0.doSplit(fr,ends0,cols,mins,maxs,rand,mtrys,0,maxDepth,nclass);
+    train.doSplit(fr,ends0,cols,mins,maxs,rand,mtrys,0,maxDepth,nclass);
+    //train.print(fr._names);
+
+    // Compact the main tree to make a dense model.
+    byte[] bits = root.compact(new AutoBuffer(),tnum,seed).buf();
+    // Install it in the Forest
+    Key tkey = Key.make("treeKey"+Key.make(),(byte)0,Key.BUILT_IN_KEY);
+    UKV.put(tkey,new Value(tkey,bits));
+    new SetOne(tnum,tkey).invoke(forestKey);
 
     // Remove local temp tree storage
     Futures fs = new Futures();
-    for( Key k : keys )
-      UKV.remove(k,fs);
+    for( Key k : keys ) UKV.remove(k,fs);
     fs.blockForPending();
 
-    root.print();
-
-    System.out.println("Done on tree "+tree+" in "+t_tree);
+    System.out.println("Done on tree "+tnum+", size="+bits.length+" in "+t_tree);
   }
 
   // The simple tree-node class.  Every tree node has a list of local-rows that
@@ -200,6 +239,7 @@ public class DRF extends Job {
     float _min, _step;     // lower-bound & step size for which kid
     DRFTree _kids[];       // Kids, if any.
     int _clss[/*nclass*/]; // Class distribution at leaves, or null in the interior
+    transient int _byteSize;    // Compacted size
 
     // Called to make a Root DRFTree.  Passed in a key, and the length of the
     // entire row list.  Sets the Key list.
@@ -306,10 +346,13 @@ public class DRF extends Job {
       _col = best_hist._col;
       _min = best_hist._min ;
       _step= best_hist._step;
-      //System.out.print(indent(depth));
+      //System.out.print(indent(depth)+fr._names[_col]+", choices: ");
       //for( int c=0; c<cols.length; c++ )
       //  System.out.print(fr._names[cols[c]]+"/"+mins[c]+"/"+maxs[c]+" ");
       //System.out.println();
+      //for( int i=0; i<best_hist._clss.length; i++ )
+      //  System.out.println(indent(depth)+Arrays.toString(best_hist._clss[i]));
+
       int cidx = cols.length-1; // Find the column in my list of active ones; might be removed
       while( cidx >= 0 && cols[cidx] != best_hist._col ) cidx--;
       assert cidx== -1 || cols[cidx]==_col;
@@ -389,20 +432,158 @@ public class DRF extends Job {
       return s;
     }
 
-    // Pretty-print a tree
-    public void print() { System.out.println(print(new StringBuilder(),0)); }
-    private StringBuilder print(StringBuilder sb, int d) {
-      for( int i = 0; i<d; i++ ) sb.append("  ");
-      sb.append("{");
+    // Pretty-print a tree.  Warning: trees can get large.  You get 1 line per
+    // node in the tree.
+    public void print(String names[]) { System.out.println(print(new StringBuilder(),names,0)); }
+    private StringBuilder print(StringBuilder sb, String[]names, int d) {
+      for( int i = 0; i<d; i++ ) sb.append("  "); // Indent
       if( _clss == null ) {     // Interior?
-        float f = _min;
-        for( int i=0; i<_kids.length; i++ ) sb.append(f+=_step).append(",");
-          
+        if( _kids == null ) {   // No class, no kids?
+          sb.append("null\n");  // No rows to train on, no prediction.
+        } else {
+          sb.append("{col=").append(names[_col]);
+          float f = _min;
+          for( int i=0; i<_kids.length; i++,f+=_step ) sb.append(',').append(f);
+          sb.append("}\n");
+          for( int i=0; i<_kids.length; i++ ) _kids[i].print(sb,names,d+1);
+        }
       } else {                  // Leaf?
+        assert _kids == null;
+        sb.append("{class= ");
+        for( int i=0; i<_clss.length; i++ ) sb.append(_clss[i]).append(",");
+        sb.append("}\n");
       }
       return sb;
     }
 
+    // Build the compressed form of a tree.
+    //  +1b #nbins,1-254.  Has child splits.  +2b column to split
+    //     For each bin 2-till last: +4b float bin max, {+1,+4} skip, then subtree bytes
+    //     Last bin: just subtree bytes
+    //  +1b 0 - Has class distribution in bytes
+    //     +1b * nclasses, 1 byte per class
+    //  +1b 255 - Has class distribution in ints
+    //     +4b * nclasses, 1 int per class
+    public AutoBuffer compact( AutoBuffer ab, int id, long seed ) { 
+      return _kids[0].compact(ab.put4(id).put8(seed));
+    }
+    private AutoBuffer compact( AutoBuffer ab ) {
+      if( _clss == null ) {     // Interior?
+        assert 0 <= _col && _col <= 65535;
+        assert _kids != null;   // Already handled before calling
+        if( _kids.length > 254 ) throw H2O.unimpl();  // Need another format for giant splits?
+        int nbins = 0;
+        for( int i=0; i<_kids.length; i++ )
+          if( !_kids[i].noPrediction() ) nbins++; // Count useful splits
+        assert nbins >= 1;       // Must be splitting something
+        int last=_kids.length-1; // Last bin with a prediction
+        while( _kids[last].noPrediction() ) last--;
+        ab.put1(nbins).put2((char)_col); // Bin count & column to split on
+        float f = _min;
+        for( int i=0; i<_kids.length; i++ ) {
+          f += _step;                    // Get bin-max
+          if( _kids[i].noPrediction() ) continue; // Skip over a no-row-no-prediction child
+          if( i<last ) {                // Last bin just has subtree bytes
+            ab.put4f(f);                // Value for bin-max
+            int skip = _kids[i].size(); // Drop down the amount to skip over
+            if( skip <= 254 ) ab.put1(skip);
+            else ab.put1(0).put3(skip);
+          }
+          _kids[i].compact(ab); // Subtree bytes
+        }
+      } else {                  // Leaf?
+        long max=Long.MIN_VALUE;
+        for( int c : _clss ) max=Math.max(max,c);
+        if( max < 256 ) { ab.put1(  0); for( int c : _clss ) ab.put1((byte)c); }
+        else            { ab.put1(255); for( int c : _clss ) ab.put4(      c); }
+      }
+      return ab;
+    }
+
+    // Compacted byteSize.  Structurally matches the compact() function above,
+    // but does an abstract length computation instead the full bits.
+    final int size( ) { return _byteSize==0 ? (_byteSize=size_impl()) : _byteSize; }
+    private int size_impl( ) {
+      if( _clss == null ) {
+        assert _kids != null;   // Already handled before calling
+        int nbins = 0;
+        for( int i=0; i<_kids.length; i++ )
+          if( !_kids[i].noPrediction() ) nbins++; // Count useful splits
+        assert nbins >= 1 : "nbin="+nbins+", col="+_col+", fmin="+_min;      // Must be splitting something
+        int last=_kids.length-1;                 // Last bin with a prediction
+        while( _kids[last].noPrediction() ) last--;
+        int sz=1+2;             // nbins & column
+        for( int i=0; i<_kids.length; i++ ) {
+          if( _kids[i].noPrediction() ) continue;
+          int szk = _kids[i].size();
+          if( i<last ) 
+            sz += 4/*Float bin-max*/ + (szk <= 254 ? 1 : 4)/*skip size*/;
+          sz += szk; // Subtree bytes
+        }
+        return sz;
+      } else {
+        long max=Long.MIN_VALUE;
+        for( int c : _clss ) max=Math.max(max,c);
+        if( max < 256 ) return 1+1*_clss.length; // Class distribution as 1 byte
+        else            return 1+4*_clss.length; // Class distribution as 4 byte
+      }
+    }
+
+    private boolean noPrediction() { return _clss==null && _kids==null; }
+
+    // Score a row on a pile-o-bits
+    public static void score( byte bits[], Frame fr, long row, int votes[] ) {
+      int idx = 4/*tnum*/+8/*seed*/;
+      Vec vecs[] = fr._vecs;
+      OUTER:
+      while( true ) {
+        int nbin = bits[idx++]&0xFF;
+        if( nbin == 0 ) {       // byte-wise class distribution
+          for( int i=0; i<votes.length; i++ )
+            votes[i] += bits[idx++]&0xFF; // Add in votes
+          return;
+        } else if( nbin == 255 ) {
+          for( int i=0; i<votes.length; i++ )
+            { votes[i] += UDP.get4(bits,idx); idx += 4; } // Add in votes
+          return;
+        } else {
+          int col = UDP.get2(bits,idx); idx+=2;
+          float f = (float)(vecs[col].at(row));
+          while( nbin > 1 ) {
+            float fx = UDP.get4f(bits,idx); idx += 4;
+            int skip = bits[idx++]&0xFF;
+            if( skip == 0 ) { skip = UDP.get3(bits,idx); idx+=3; }
+            if( f < fx ) continue OUTER; // Continue on outer loop in this subtree
+            idx += skip;                 // Else skip subtree
+            nbin--;
+          }
+          // Continue on outer loop in final subtree
+        }
+      }
+    }
+
+    private static long merge_d_n(int depth, int nodes ) { return ((long)depth)<<32 | nodes; }
+    public static long stats( byte bits[] ) { return stats(bits,4/*tnum*/+8/*seed*/,0,0,0); }
+    private static long stats( byte bits[], int idx, int depth, int maxd, int nodes ) {
+      nodes++;
+      if( depth > maxd ) maxd = depth;
+      int nbin = bits[idx++]&0xFF;
+      if( nbin == 0 || nbin==255 ) 
+        return merge_d_n(maxd,nodes);
+      idx += 2;                 // Column
+      while( nbin > 1 ) {
+        idx += 4;               // Float
+        int skip = bits[idx++]&0xFF;
+        if( skip == 0 ) { skip = UDP.get3(bits,idx); idx+=3; }
+        long d_n = stats(bits,idx,depth+1,maxd,nodes);
+        maxd  = (int)(d_n>>32);
+        nodes = (int)(d_n    );
+        idx += skip;
+        nbin--;
+      }
+      // Last guy has no float/skip bytes
+      return stats(bits,idx,depth+1,maxd,nodes);
+    }
   }
 
   // ---
@@ -434,7 +615,7 @@ public class DRF extends Job {
   // having each Node segregate the data rows from 'beg' to 'end' into 2
   // sections, one from 'beg' to the midpoint, and the other from midpoint to
   // the end.  The actual rows are kept in the giant LocalTree array on each Node.
-  private static abstract class Split extends DRemoteTask<Split> {
+  private static abstract class Split<T extends Split> extends DRemoteTask<T> {
     // INPUT - cleared after local work
     DRFTree _drf;               // The guy being split
     int _ends[];                // Ends of split rows
@@ -474,18 +655,12 @@ public class DRF extends Job {
       _ends = null;             // No need to pass ends back
       tryComplete();
     }
-    // Combine Key/beg lists from across the cluster
-    @Override public void reduce(Split spl) {
-      if( spl == null ) return;
-      if( _drf == null ) _drf = spl._drf;
-      else _drf.add2(spl._drf);
-    }
   }
 
   // ---
   // Split the top-level tree root based on a sampling criteria.  Move the
   // sampled-out rows to one end and the sampled-in rows to the other.
-  private static class SampleSplit extends Split {
+  private static class SampleSplit extends Split<SampleSplit> {
     // INPUTS
     final double _sampleRate;
     final long _seed;
@@ -521,11 +696,17 @@ public class DRF extends Job {
       _drf._kids[0] = new DRFTree(beg);
       _drf._kids[1] = new DRFTree(mid);
     }
+    // Combine Key/beg lists from across the cluster
+    @Override public void reduce(SampleSplit spl) {
+      if( spl == null ) return;
+      if( _drf == null ) _drf = spl._drf;
+      else _drf.add2(spl._drf);
+    }
   }
 
   // ---
   // Split based on a histogram & column choice
-  private static class HistoSplit extends Split {
+  private static class HistoSplit extends Split<HistoSplit> {
     // INPUT - cleared after local work
     DHisto2 _dh2;               // Histogram to split on
     HistoSplit( DRFTree tree, int[] ends, DHisto2 dh2 ) { 
@@ -567,6 +748,69 @@ public class DRF extends Job {
       // Performance wart: should/could flip back and forth between rows0 & rows1
       System.arraycopy(rs1,beg,rs0,beg,(end-beg));
       _dh2 = null;              // Do not pass this back
+    }
+    @Override public void reduce(HistoSplit spl) { }
+  }
+
+  // ---
+  // Class for computing a Confusion Matrix in the Out-Of-Bag-Error-Estimate style
+  private static class OOBEETask extends DRemoteTask<OOBEETask> {
+    Forest _forest;
+    Frame _fr;
+    final float _sampleRate;
+    long _cm[][];               // OOBEE-style Confusion Matrix
+    OOBEETask( Forest forest, float sampleRate, Frame fr ) { _forest = forest;  _sampleRate=sampleRate;  _fr=fr;}
+    @Override public void lcompute() {
+      // Load all the trees locally, init RNGs to replay the sampling
+      int ntrees = _forest._treeKeys.length;
+      byte tbits[][] = new byte[ntrees][];
+      Random rands[] = new Random[ntrees]; // Also make a pile-o-RNGs
+      for( int i=0; i<ntrees; i++ ) {
+        tbits[i] = DKV.get(_forest._treeKeys[i]).getBytes();
+        assert UDP.get4(tbits[i],0/*tree id*/)==i; // Check tree-bits for sane ID's
+        rands[i] = Utils.getRNG(UDP.get8(tbits[i],4/*seed*/));
+      }
+
+      // Get the response column & class ymin offset
+      Vec vecs[] = _fr._vecs;
+      Vec vy = vecs[vecs.length-1]; // Response is last vec
+      int ymin = (int)vy.min();
+      if( ymin != _forest._ymin ) throw H2O.unimpl(); // Need to adjust for alternate ymin
+      int ncls = (int)vy.max()-ymin+1;
+      if( ncls != _forest._nclass ) throw H2O.unimpl(); // Need to adjust for alternate class count
+      int votes[] = new int[ncls]; // Votes on a row
+      _cm = new long[ncls][ncls];  // Confusion Matrix
+
+      // Replay the RNG pattern over the rows
+      Vec v0 = _fr.firstReadable();
+      int nchunks = v0.nChunks();
+      for( int chk=0; chk<nchunks; chk++ )
+        if( v0.chunkKey(chk).home() ) { // For all local rows
+          long end = v0.chunk2StartElem(chk+1);
+          for( long r=v0.chunk2StartElem(chk); r<end; r++ ) {
+            Arrays.fill(votes,0);                          // Reset voting for a new row
+            for( int t=0; t<ntrees; t++ )                  // For all trees
+              if( !(rands[t].nextFloat() <= _sampleRate) ) // Replay sampler, negated
+                DRFTree.score(tbits[t],_fr,r,votes);       // Get votes for this tree
+            // Find max vote.  No tie-breaker logic.
+            int m = 0;
+            for( int i=1; i<ncls; i++ )
+              if( votes[i] > votes[m] ) m=i;
+            int y = (int)vy.at8(r)-ymin; // Actual answer
+            _cm[y][m]++;                 // We voted class 'm'.
+          }
+        }
+
+      _forest = null;           // Do not pass this back
+      _fr = null;
+      tryComplete();
+    }
+    @Override public void reduce(OOBEETask cm) { 
+      if( _cm == null ) _cm = cm._cm;
+      else if( cm._cm != null ) 
+        for( int i=0; i<_cm.length; i++ )
+          for( int j=0; j<_cm.length; j++ )
+            _cm[i][j] += cm._cm[i][j];
     }
   }
 
@@ -732,19 +976,18 @@ public class DRF extends Job {
     }
   }
 
-
   // --------------------------------------------------------------------------
   // The local top-level tree-info for one tree.
   private static class LocalTree extends Iced {
     final Key _key;             // A unique cookie for this datastructure
-    final Frame _fr;            // Frame for the tree being built
+    final Frame _fr;            // Frame for data-layout and handy vec access
     final long [] _rows0;       // All the local datarows
     final long [] _rows1;       // Double-buffered for easier splitting
     LocalTree( Key key, Frame fr ) {
       _key = key;
       _fr = fr;
-      Vec v0 = fr.firstReadable();
       long sum=0;
+      Vec v0 = fr.firstReadable();
       int nchunks = v0.nChunks();
       for( int i=0; i<nchunks; i++ )
         if( v0.chunkKey(i).home() )
@@ -782,5 +1025,4 @@ public class DRF extends Job {
   static void swap( int   is[], int i, int j ) { int   tmp = is[i]; is[i] = is[j]; is[j] = tmp; }
   static void swap( float fs[], int i, int j ) { float tmp = fs[i]; fs[i] = fs[j]; fs[j] = tmp; }
   static void swap( long  ls[], int i, int j ) { long  tmp = ls[i]; ls[i] = ls[j]; ls[j] = tmp; }
-
 }
